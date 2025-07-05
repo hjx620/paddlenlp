@@ -33,7 +33,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import time
 import numpy as np
 import paddle
 import paddle.amp.auto_cast as autocast
@@ -170,7 +170,7 @@ TRAINER_STATE_NAME = "trainer_state.json"
 OPTIMIZER_NAME = "optimizer.pdopt"
 SCHEDULER_NAME = "scheduler.pdparams"
 SCALER_NAME = "scaler.pdparams"
-
+# paddle.set_default_dtype("float16")
 
 if is_datasets_available():
     import datasets
@@ -825,6 +825,11 @@ class Trainer:
                 # the numel is roughly, because the tensor parallel still hold own bias or layer_norm weight without splited
                 # so, the trainable numel is a little bigger than real.
                 logger.debug(f"  Number of trainable parameters = {trainable_numel:,} (all devices, roughly)")
+        # for param in model.parameters():
+        #     if not param.stop_gradient :
+        #         param = param.astype("float32")
+        #     if param.stop_gradient :
+        #         param = param.astype("float16")
 
         return self._inner_training_loop(
             args,
@@ -1319,7 +1324,7 @@ class Trainer:
         if self.args.world_size <= 1:
             return paddle.io.BatchSampler(
                 dataset=self.train_dataset,
-                shuffle=True,
+                shuffle=False,
                 batch_size=self.args.per_device_train_batch_size,
                 drop_last=self.args.dataloader_drop_last,
             )
@@ -1327,7 +1332,7 @@ class Trainer:
         return DistributedBatchSampler(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
-            shuffle=True,
+            shuffle=False,
             num_replicas=self.args.dataset_world_size,
             rank=self.args.dataset_rank,
             drop_last=self.args.dataloader_drop_last,
@@ -2159,7 +2164,7 @@ class Trainer:
                 labels = inputs["generator_labels"]
         else:
             labels = None
-
+        #logger.info(f"inputs:{inputs}")
         outputs = model(**inputs)
 
         if self.criterion is not None:
@@ -2449,10 +2454,14 @@ class Trainer:
 
         self.runtime_timer.stop()
         # Determine the new best metric / best model checkpoint
+        logger.info(f"metrics:{metrics}")
+        time.sleep(10)
         if metrics is not None and self.args.metric_for_best_model is not None:
             metric_to_check = self.args.metric_for_best_model
             if not metric_to_check.startswith("eval_"):
                 metric_to_check = f"eval_{metric_to_check}"
+            logger.info(f"metrics:{metric_to_check}")
+            time.sleep(10)
             metric_value = metrics[metric_to_check]
 
             operator = np.greater if self.args.greater_is_better else np.less
@@ -2887,7 +2896,7 @@ class Trainer:
         Works both with or without labels.
         """
         args = self.args
-
+        max_eval_iters = 2
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
         if self.args.pipeline_parallel_degree > 1:
@@ -2928,7 +2937,7 @@ class Trainer:
 
         if not self.args.distributed_dataloader or (
             self.args.distributed_dataloader and self.args.should_load_dataset
-        ):
+        ):  
             if has_length(dataloader):
                 logger.info(f"  Num examples = {self.num_examples(dataloader)}")
                 if max_eval_iters > 0:

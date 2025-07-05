@@ -11,45 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import contextlib
 import math
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
+from functools import partial
 import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
-from paddle.distributed import fleet
-from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
 from paddle.utils import map_structure
-
+from paddle.distributed import fleet
 from paddlenlp.transformers.long_sequence_strategies import LongSequenceStrategies
-
+import time
 from ...utils.converter import StateDictNameMapping, init_name_mappings
-from .. import PretrainedModel, linear_utils, register_base_model
+from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithPast,
     ModelOutput,
 )
 from .configuration import CHATGLM_V2_PRETRAINED_RESOURCE_FILES_MAP, ChatGLMv2Config
-
-try:
-    from paddle.distributed.fleet.utils.sequence_parallel_utils import (
-        GatherOp,
-        ScatterOp,
-        mark_as_sequence_parallel_parameter,
-    )
-except:
-    pass
-
-try:
-    from paddle.incubate.nn.layer.fused_dropout_add import FusedDropoutAdd
-except:
-    FusedDropoutAdd = None
+import numpy as np
+import logging
+#paddle.set_default_dtype("float16")
+logger = logging.getLogger('auto_tuner')
+logger.setLevel(logging.INFO)
 
 __all__ = [
     "ChatGLMv2Model",
@@ -58,49 +43,15 @@ __all__ = [
 ]
 
 
-def seed_guard_context(name=None):
-    if (
-        not isinstance(paddle.base.framework._current_expected_place(), paddle.core.CPUPlace)
-        and name in get_rng_state_tracker().states_
-    ):
-        # todo fix it
-        #  ValueError: Length of gpu state list should be equal to the gpu device count
-        #  /usr/local/lib/python3.10/dist-packages/paddle/incubate/framework/random.py:119: ValueError
-        # return contextlib.nullcontext()
-        return get_rng_state_tracker().rng_state(name)
-    else:
-        return contextlib.nullcontext()
-
-
-def parallel_matmul(lm_output, logit_weights, parallel_output):
-    hcg = fleet.get_hybrid_communicate_group()
-    model_parallel_group = hcg.get_model_parallel_group()
-    world_size = hcg.get_model_parallel_world_size()
-
-    if world_size > 1:
-        # _c_identity is backwards is reduce
-        input_parallel = paddle.distributed.collective._c_identity(lm_output, group=model_parallel_group)
-
-        logits = paddle.matmul(input_parallel, logit_weights, transpose_y=False)
-
-        if parallel_output:
-            return logits
-
-        # _c_concat has not grad backwards
-        return paddle.distributed.collective._c_concat(logits, group=model_parallel_group)
-    else:
-        logits = paddle.matmul(lm_output, logit_weights, transpose_y=False)
-        return logits
-
-
 class RotaryEmbedding(nn.Layer):
-    def __init__(self, dim, original_impl=False):
+    def __init__(self, dim, original_impl=True):
         super().__init__()
         self.default_dtype = paddle.get_default_dtype()
+        #self.default_dtype = 'float16'
         inv_freq = 1.0 / (10000 ** (paddle.arange(0, dim, 2, dtype="float32") / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.dim = dim
-        self.original_impl = original_impl
+        self.original_impl = True
 
     def forward_impl(self, seq_len: int, n_elem: int, base: int = 10000):
         """Enhanced Transformer with Rotary Position Embedding.
@@ -110,23 +61,31 @@ class RotaryEmbedding(nn.Layer):
         """
         # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
         theta = 1.0 / (base ** (paddle.arange(0, n_elem, 2, dtype="float32") / n_elem))
-
+        ####logger.info(f"theta :{theta}")
         # Create position indexes `[0, 1, ..., seq_len - 1]`
-        seq_idx = paddle.arange(0, seq_len, dtype=theta.dtype)
-
+        seq_idx = paddle.arange(0, seq_len, dtype="float32")
+        ####logger.info(f"seq_idx :{seq_idx}")
         # Calculate the product of position index and $\theta_i$
+        #wrong
         idx_theta = paddle.outer(seq_idx, theta).astype(self.default_dtype)
-
+        ####logger.info(f"idx_theta :{idx_theta}")
         cache = paddle.stack([paddle.cos(idx_theta), paddle.sin(idx_theta)], axis=-1)
 
         # this is to mimic the behaviour of complex32, else we will get different results
+        #if self.default_dtype in (paddle.float16, paddle.bfloat16, paddle.int8):
         if self.default_dtype in (paddle.float16, paddle.bfloat16, paddle.int8):
-            cache = cache.astype(self.default_dtype)
-            # cache = cache.bfloat16() if dtype == paddle.bfloat16 else cache.astype("float16")
+            #cache = cache.astype(self.default_dtype)
+            #cache = cache.bfloat16() if dtype == paddle.bfloat16 else cache.astype("float16")
+            cache = cache.astype("bfloat16") if self.default_dtype == "bfloat16" else cache.astype("float16")
+        ####logger.info(f"cache :{cache}")
         return cache
 
     def forward(self, max_seq_len, offset=0):
-        return self.forward_impl(seq_len=max_seq_len, n_elem=self.dim)
+        output = self.forward_impl(seq_len=max_seq_len, n_elem=self.dim)
+        #logger.info(f"RotaryEmbedding")
+        #logger.info(f"RotaryEmbedding_output:{output}")
+
+        return output
 
 
 # @paddle.jit.script
@@ -151,7 +110,7 @@ def apply_rotary_pos_emb(x: paddle.Tensor, rope_cache: paddle.Tensor) -> paddle.
 
 
 class RMSNorm(nn.Layer):
-    def __init__(self, hidden_size, config: ChatGLMv2Config, epsilon=None):
+    def __init__(self, hidden_size, epsilon=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.weight = paddle.create_parameter(
@@ -161,17 +120,16 @@ class RMSNorm(nn.Layer):
         )
         self.epsilon = 1e-5 if epsilon is None else epsilon
 
-        if config.sequence_parallel:
-            mark_as_sequence_parallel_parameter(self.weight)
-
     def forward(self, hidden_states):
+        #######logger.info(f"RMSNorm")
+        #######logger.info(f"input:{hidden_states}")
         input_dtype = hidden_states.dtype
         variance = hidden_states.astype("float32").pow(2).mean(-1, keepdim=True)
-        hidden_states = paddle.rsqrt(variance + self.epsilon) * hidden_states
-        output = (hidden_states * self.weight).astype(input_dtype)
+        hidden_states = hidden_states * paddle.rsqrt(variance + self.epsilon) 
+        output = (self.weight * hidden_states).astype(input_dtype)
 
-        # if self.weight.dtype in [paddle.float16, paddle.bfloat16]:
-        #     hidden_states = paddle.cast(hidden_states, self.weight.dtype)
+        #logger.info(f"RMSNorm")
+        #logger.info(f"RMSNorm_output:{output}")
         return output
 
 
@@ -180,30 +138,35 @@ class CoreAttention(nn.Layer):
         super(CoreAttention, self).__init__()
 
         self.default_dtype = paddle.get_default_dtype()
+        #self.default_dtype = 'float16'
         self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
         self.layer_number = max(1, layer_number)
+
         self.num_attention_heads_per_partition = config.num_attention_heads
         self.hidden_size_per_partition = config.kv_channels * self.num_attention_heads_per_partition
         self.hidden_size_per_attention_head = self.hidden_size_per_partition // self.num_attention_heads_per_partition
+
         self.tensor_parallel_degree = config.tensor_parallel_degree
         if self.tensor_parallel_degree > 1:
             assert (
                 self.hidden_size_per_partition % self.tensor_parallel_degree == 0
             ), "hidden_size_per_partition % tensor_parallel_degree must be zero."
             self.hidden_size_per_partition = self.hidden_size_per_partition // self.tensor_parallel_degree
+
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         if self.apply_query_key_layer_scaling:
             coeff = self.layer_number
             self.norm_factor *= coeff
         self.coeff = coeff
-        self.config = config
+
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+
+    def forward(self, query_layer, key_layer, value_layer, attention_mask=None):
         # Raw attention scores
         # [batch_size, num_heads, query_length, key_length]
         output_size = (query_layer.shape[1], query_layer.shape[2], query_layer.shape[0], key_layer.shape[0])
@@ -231,15 +194,43 @@ class CoreAttention(nn.Layer):
         if self.coeff is not None:
             attention_scores = attention_scores * self.coeff
 
-        attention_scores = attention_scores + attention_mask
+        full_attention_mask = attention_mask
+        # if attention_mask is not None:
+        #     full_attention_mask = self.get_masks(attention_mask, output_size[2], output_size[1])
+
+        if full_attention_mask is None and attention_scores.shape[2] == attention_scores.shape[3]:
+            # Create a lower triangular mask with ones
+            tril_attention_mask = paddle.ones(
+                shape=[output_size[0], 1, output_size[2], output_size[3]],
+                dtype='bool'
+            )
+            # Make the mask lower triangular
+            tril_attention_mask = paddle.tril(tril_attention_mask)
+            # Invert the mask (logical NOT)
+            tril_attention_mask = ~tril_attention_mask
+            full_attention_mask = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
+        elif full_attention_mask is not None and attention_scores.shape[2] == attention_scores.shape[3]:
+            # Create a lower triangular mask with ones
+            tril_attention_mask = paddle.ones(
+                shape=[output_size[0], 1, output_size[2], output_size[3]],
+                dtype='bool'
+            )
+            # Make the mask lower triangular
+            tril_attention_mask = paddle.tril(tril_attention_mask)
+            # Invert the mask (logical NOT)
+            tril_attention_mask = ~tril_attention_mask
+            tril_attention_mask = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
+            full_attention_mask = full_attention_mask + tril_attention_mask
+
+        if full_attention_mask is not None:
+            attention_scores = attention_scores + full_attention_mask#这一句没用要修改，要把
 
         attention_probs = F.softmax(attention_scores.astype("float32"), axis=-1)
         attention_probs = attention_probs.astype(self.default_dtype)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-        with seed_guard_context("local_seed"):
-            attention_probs = self.attention_dropout(attention_probs)
+        attention_probs = self.attention_dropout(attention_probs)
         # [batch_size, num_heads, query_length, key_length]
 
         # value_layer -> context layer.
@@ -261,12 +252,7 @@ class CoreAttention(nn.Layer):
         new_context_shape = context_layer.shape[:-2] + [self.hidden_size_per_partition]
         context_layer = context_layer.reshape(new_context_shape)
 
-        if self.config.sequence_parallel:
-            sq, b, hp = context_layer.shape
-            context_layer = context_layer.reshape([sq * b, hp])
-
         return context_layer
-
 
 class SelfAttention(nn.Layer):
     """Parallel self-attention layer abstract class.
@@ -278,39 +264,26 @@ class SelfAttention(nn.Layer):
     def __init__(self, config: ChatGLMv2Config, layer_number, device=None):
         super(SelfAttention, self).__init__()
         self.layer_number = max(1, layer_number)
-        assert (
-            config.kv_channels * config.num_attention_heads == config.hidden_size
-        ), "`kv_channels` * `num_attention_heads` must equal to `hidden_size`"
+        # assert (
+        #     config.kv_channels * config.num_attention_heads == config.hidden_size
+        # ), "`kv_channels` * `num_attention_heads` must equal to `hidden_size`"
 
         # Per attention head and per partition values.
+
         self.hidden_size_per_attention_head = config.hidden_size // config.num_attention_heads
         self.core_attention = CoreAttention(config, self.layer_number)
         self.num_multi_query_groups_per_partition = config.multi_query_group_num
+
         self.multi_query_group_num = config.multi_query_group_num
         self.num_attention_heads_per_partition = config.num_attention_heads
-        self.config = config
-        self.seq_length = config.seq_length
-        # Recompute defaults to False and is controlled by Trainer
-        self.enable_recompute = False
         self.tensor_parallel_degree = config.tensor_parallel_degree
-        self.sequence_parallel = config.sequence_parallel
-
-        if config.sequence_parallel:
-            ColumnParallelLinear = linear_utils.ColumnSequenceParallelLinear
-            RowParallelLinear = linear_utils.RowSequenceParallelLinear
-        else:
-            ColumnParallelLinear = linear_utils.ColumnParallelLinear
-            RowParallelLinear = linear_utils.RowParallelLinear
 
         if config.tensor_parallel_degree > 1:
-            self.query_key_value = ColumnParallelLinear(
-                config.hidden_size,
-                config.hidden_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num,
-                has_bias=config.add_bias_linear or config.add_qkv_bias,
-                gather_output=False,
+            self.query_key_value = fleet.meta_parallel.ColumnParallelLinear(
+                config.hidden_size, config.hidden_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num, has_bias=config.add_bias_linear or config.add_qkv_bias, gather_output=False
             )
-            self.dense = RowParallelLinear(
-                config.hidden_size, config.hidden_size, input_is_parallel=True, has_bias=config.add_bias_linear
+            self.dense = fleet.meta_parallel.RowParallelLinear(
+                config.hidden_size, config.hidden_size, input_is_parallel=True, has_bias=False
             )
             self.num_attention_heads_per_partition = config.num_attention_heads // config.tensor_parallel_degree
             assert (
@@ -325,18 +298,17 @@ class SelfAttention(nn.Layer):
                 config.hidden_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num,
                 bias_attr=config.add_bias_linear or config.add_qkv_bias,
             )
-            # Output.
             self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=config.add_bias_linear)
 
-    def _core_attention(self, q, k, v, attention_mask=None, output_attentions=False):
-        outputs = self.core_attention(q, k, v, attention_mask)
-        return outputs
 
-    def forward(
-        self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True, output_attentions=False
-    ):
-        # seq_length, batch_size = self.config.seq_length, hidden_states.shape[0]//self.config.seq_length
+    def forward(self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True):
+        #logger.info(f"self_atten_hidden_states:{hidden_states}")
+        ###logger.info(f"query_key_value.weight:{self.query_key_value.weight}")
+        seq_length, batch_size, hidden_size = hidden_states.shape
+
         mixed_x_layer = self.query_key_value(hidden_states)
+        #logger.info(f"self_atten_query_key_value:{mixed_x_layer}")
+
         (query_layer, key_layer, value_layer) = mixed_x_layer.split(
             [
                 self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
@@ -345,45 +317,39 @@ class SelfAttention(nn.Layer):
             ],
             axis=-1,
         )
-        if self.sequence_parallel:
-            query_layer = query_layer.reshape(
-                [self.seq_length, -1, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
-            )
-            key_layer = key_layer.reshape(
-                [self.seq_length, -1, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head]
-            )
-            value_layer = value_layer.reshape(
-                [self.seq_length, -1, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head]
-            )
-        else:
-            query_layer = query_layer.reshape(
-                [0, 0, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
-            )
-            key_layer = key_layer.reshape(
-                [0, 0, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head]
-            )
-            value_layer = value_layer.reshape(
-                [0, 0, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head]
-            )
+
+        
+        query_layer = query_layer.reshape(
+            [seq_length, batch_size, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
+        )
+        key_layer = key_layer.reshape([seq_length, batch_size, -1, self.hidden_size_per_attention_head])
+        value_layer = value_layer.reshape([seq_length, batch_size, -1, self.hidden_size_per_attention_head])
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             query_layer = apply_rotary_pos_emb(query_layer, rotary_pos_emb)
             key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
-
+        #logger.info(f"rotary_pos_emb——query_layer:{query_layer}")
+        #logger.info(f"rotary_pos_emb——key_layer:{key_layer}")
         # adjust key and value for inference
         if use_cache:
             if kv_cache is not None:
+                #logger.info(f"kv_cache is not None")
                 cache_k, cache_v = kv_cache
+                # #######logger.info(f"cache{cache_k}")
+                # #######logger.info(f"key{key_layer}")
+                # time.sleep(10)
                 key_layer = paddle.concat((cache_k, key_layer), axis=0)
                 value_layer = paddle.concat((cache_v, value_layer), axis=0)
             kv_cache = (key_layer, value_layer)
         else:
             kv_cache = None
-
+        ########logger.info(f"self.num_attention_heads_per_partition:{self.num_attention_heads_per_partition}")
+        #self.num_multi_query_groups_per_partition = 1
         multiplier = self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition
-
+        ########logger.info(f"key_layer.shape:{key_layer.shape}")
         key_layer = key_layer.unsqueeze(-2).tile([1, 1, 1, multiplier, 1])
+        ########logger.info(f"key_layer.shape2:{key_layer.shape}")
         key_layer = key_layer.reshape(
             key_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
         )
@@ -391,33 +357,25 @@ class SelfAttention(nn.Layer):
         value_layer = value_layer.reshape(
             value_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
         )
-
+        #logger.info(f"core_before——query_layer:{query_layer}")
+        #logger.info(f"core_before——key_layer:{key_layer}")
+        #logger.info(f"core_before——value_layer:{value_layer}")
+        #logger.info(f"attention_mask{attention_mask}")
         # ==================================
         # core attention computation
         # ==================================
-        attention_fuc = self._core_attention
+        
+        context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+        ########logger.info(f"context_layer:{context_layer}")
 
-        has_gradient = (
-            (not query_layer.stop_gradient) or (not key_layer.stop_gradient) or (not value_layer.stop_gradient)
-        )
-        if self.enable_recompute and self.config.recompute_granularity == "core_attn" and has_gradient:
-            context_layer = recompute(
-                attention_fuc,
-                query_layer,
-                key_layer,
-                value_layer,
-                attention_mask,
-                output_attentions,
-                use_reentrant=False,
-            )
-        else:
-            context_layer = attention_fuc(
-                query_layer, key_layer, value_layer, attention_mask=attention_mask, output_attentions=output_attentions
-            )
         # =================
         # Output. [seq_length, b, h]
         # =================
+
         output = self.dense(context_layer)
+        #####logger.info(f"SelfAttention")
+        #####logger.info(f"output:{output}")
+        #####logger.info(f"kv_cache:{kv_cache}")
         return output, kv_cache
 
 
@@ -431,20 +389,15 @@ class MLP(nn.Layer):
 
     def __init__(self, config: ChatGLMv2Config):
         super(MLP, self).__init__()
-
+   
         self.add_bias = config.add_bias_linear
 
-        if config.sequence_parallel:
-            ColumnParallelLinear = linear_utils.ColumnSequenceParallelLinear
-            RowParallelLinear = linear_utils.RowSequenceParallelLinear
-        else:
-            ColumnParallelLinear = linear_utils.ColumnParallelLinear
-            RowParallelLinear = linear_utils.RowParallelLinear
         if config.tensor_parallel_degree > 1:
-            self.dense_h_to_4h = ColumnParallelLinear(
-                config.hidden_size, config.ffn_hidden_size * 2, has_bias=self.add_bias, gather_output=False
+            self.dense_h_to_4h = fleet.meta_parallel.ColumnParallelLinear(
+                config.hidden_size, 2* config.ffn_hidden_size, has_bias=self.add_bias, gather_output=False
             )
-            self.dense_4h_to_h = RowParallelLinear(
+            
+            self.dense_4h_to_h = fleet.meta_parallel.RowParallelLinear(
                 config.ffn_hidden_size, config.hidden_size, input_is_parallel=True, has_bias=self.add_bias
             )
         else:
@@ -458,16 +411,13 @@ class MLP(nn.Layer):
             )
 
     def forward(self, hidden_states):
-        # [s, b, 4hp]
         intermediate_parallel = self.dense_h_to_4h(hidden_states)
-        # Special Slicing to accomodate Tensor Parallel
-        # Even channels is ffc_fc, odd channels is gate
         dim_size = intermediate_parallel.shape[-1]
         ffn_fc = intermediate_parallel[..., : dim_size // 2]
         gate = intermediate_parallel[..., dim_size // 2 :]
         intermediate_parallel = F.silu(ffn_fc) * gate
-        # [s, b, h]
         output = self.dense_4h_to_h(intermediate_parallel)
+        #####logger.info(f"MLP_output:{output}")
         return output
 
 
@@ -478,30 +428,32 @@ class GLMBlock(nn.Layer):
     output of the same size.
     """
 
-    def __init__(self, config: ChatGLMv2Config, layer_number):
+    def __init__(self, config: ChatGLMv2Config, layer_number,layerwise_recompute: bool = False,kv_caches = None):
         super(GLMBlock, self).__init__()
         self.layer_number = layer_number
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
-        # Recompute defaults to False and is controlled by Trainer
-        self.enable_recompute = False
-        self.config = config
+
         self.fp32_residual_connection = config.fp32_residual_connection
 
         LayerNormFunc = RMSNorm if config.rmsnorm else nn.LayerNorm
         # Layernorm on the input data.
-        self.input_layernorm = LayerNormFunc(config.hidden_size, epsilon=config.layernorm_epsilon, config=config)
+        self.input_layernorm = LayerNormFunc(config.hidden_size, epsilon=config.layernorm_epsilon)
 
         # Self attention.
         self.self_attention = SelfAttention(config, layer_number)
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNormFunc(
-            config.hidden_size, epsilon=config.layernorm_epsilon, config=config
-        )
+        self.post_attention_layernorm = LayerNormFunc(config.hidden_size, epsilon=config.layernorm_epsilon)
 
         # MLP
         self.mlp = MLP(config)
+        #pp添加
+        self.enable_recompute = False
+        self.layerwise_recompute = layerwise_recompute
+        self.recompute_granularity = config.recompute_granularity
+        self.config = config
+        self.kv_caches = kv_caches
 
     def forward(
         self,
@@ -510,27 +462,17 @@ class GLMBlock(nn.Layer):
         rotary_pos_emb,
         kv_cache=None,
         use_cache=True,
-    ):
+    ):   
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
 
-        has_gradient = not layernorm_output.stop_gradient
         # Self attention.
-        if self.enable_recompute and has_gradient and self.config.recompute_granularity == "full_attn":
-            attention_output, kv_cache = recompute(
-                self.self_attention,
-                layernorm_output,
-                attention_mask,
-                rotary_pos_emb,
-                kv_cache=kv_cache,
-                use_cache=use_cache,
-            )
-        else:
-            attention_output, kv_cache = self.self_attention(
-                layernorm_output, attention_mask, rotary_pos_emb, kv_cache=kv_cache, use_cache=use_cache
-            )
+        attention_output, kv_cache = self.self_attention(
+            layernorm_output, attention_mask, rotary_pos_emb, kv_cache=kv_cache, use_cache=use_cache
+        )
+
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -538,17 +480,16 @@ class GLMBlock(nn.Layer):
         else:
             residual = hidden_states
 
-        current_seed = "local_seed" if self.config.sequence_parallel else "global_seed"
-
-        with seed_guard_context(current_seed):
-            layernorm_input = F.dropout(attention_output, p=self.hidden_dropout, training=self.training)
+        layernorm_input = F.dropout(attention_output, p=self.hidden_dropout, training=self.training)
         layernorm_input = residual + layernorm_input
 
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # MLP.
+
         mlp_output = self.mlp(layernorm_output)
+
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -556,9 +497,11 @@ class GLMBlock(nn.Layer):
         else:
             residual = layernorm_input
 
-        with seed_guard_context(current_seed):
-            output = F.dropout(mlp_output, p=self.hidden_dropout, training=self.training)
+        output = F.dropout(mlp_output, p=self.hidden_dropout, training=self.training)
         output = residual + output
+        #logger.info(f"GLMBlock")
+        #logger.info(f"output:{output}")
+        #logger.info(f"kv_cache:{kv_cache}")
         return output, kv_cache
 
 
@@ -568,13 +511,9 @@ class GLMTransformer(nn.Layer):
     def __init__(self, config: ChatGLMv2Config):
         super(GLMTransformer, self).__init__()
         self.config = config
-        # Recompute defaults to False and is controlled by Trainer
         self.enable_recompute = False
-        self.no_recompute_layers = config.no_recompute_layers if config.no_recompute_layers is not None else []
-        self.recompute_granularity = config.recompute_granularity
         self.fp32_residual_connection = config.fp32_residual_connection
         self.post_layer_norm = config.post_layer_norm
-
         # Number of layers.
         self.num_hidden_layers = config.num_hidden_layers
 
@@ -583,11 +522,11 @@ class GLMTransformer(nn.Layer):
             return GLMBlock(config, layer_number)
 
         self.layers = nn.LayerList([build_layer(i + 1) for i in range(self.num_hidden_layers)])
-
+        #self.layers = nn.LayerList([build_layer(i + 1) for i in range(1)])
         if self.post_layer_norm:
             LayerNormFunc = RMSNorm if config.rmsnorm else nn.LayerNorm
             # Final layer norm before output.
-            self.final_layernorm = LayerNormFunc(config.hidden_size, epsilon=config.layernorm_epsilon, config=config)
+            self.final_layernorm = LayerNormFunc(config.hidden_size, epsilon=config.layernorm_epsilon)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -627,29 +566,32 @@ class GLMTransformer(nn.Layer):
         kv_caches=None,
         use_cache: Optional[bool] = True,
         output_hidden_states: Optional[bool] = False,
-    ):
+    ):  
+        ##logger.info(f"transformer :")
+        ##logger.info(f"hidden_states :{hidden_states}")
+        ##logger.info(f"attention_mask:{attention_mask}")
+        ##logger.info(f"rotary_pos_emb:{rotary_pos_emb}")
+        ##logger.info(f"kv_caches:{kv_caches}")
+        ##logger.info(f"output_hidden_states:{output_hidden_states}")
+        ##logger.info(f"use_cache:{use_cache}")
+        
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_hidden_layers)]
         presents = () if use_cache else None
         all_self_attentions = None
         all_hidden_states = () if output_hidden_states else None
 
-        zero = paddle.zeros(attention_mask.shape, dtype=hidden_states.dtype)
-        neg_inf = paddle.full_like(attention_mask, paddle.finfo(hidden_states.dtype).min, dtype=hidden_states.dtype)
-        attention_mask = paddle.where(attention_mask, zero, neg_inf)
-
+        # zero = paddle.zeros(attention_mask.shape, dtype=hidden_states.dtype)
+        # neg_inf = paddle.full_like(attention_mask, paddle.finfo(hidden_states.dtype).min, dtype=hidden_states.dtype)
+        # attention_mask = paddle.where(attention_mask, zero, neg_inf)#12.2
+        #for index in range(2):
         for index in range(self.num_hidden_layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             layer = self._get_layer(index)
 
-            if (
-                self.enable_recompute
-                and not hidden_states.stop_gradient
-                and index not in self.no_recompute_layers
-                and self.recompute_granularity == "full"
-            ):
+            if self.enable_recompute and not hidden_states.stop_gradient:
                 hidden_states, kv_cache = self.recompute_training(
                     layer,
                     hidden_states,
@@ -686,42 +628,37 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
     pretrained_resource_files_map = CHATGLM_V2_PRETRAINED_RESOURCE_FILES_MAP
     base_model_prefix = "chatglm_v2"
 
+
     def get_masks(self, input_ids, past_key_values, padding_mask=None):
         batch_size, seq_length = input_ids.shape
-
-        # casual mask
-        casual_mask = paddle.tril(paddle.ones([batch_size, 1, seq_length, seq_length])).astype("bool")
+        # Initialize the full attention mask with ones and set the lower triangular mask
+        full_attention_mask = paddle.ones((batch_size, seq_length, seq_length), dtype='float32')
+        full_attention_mask = paddle.tril(full_attention_mask)
+        
         past_length = 0
         if past_key_values:
             past_length = past_key_values[0][0].shape[0]
+        
         if past_length:
-            casual_mask = paddle.concat(
-                [paddle.ones([batch_size, 1, seq_length, past_length], dtype="bool"), casual_mask], axis=-1
-            )
-
-        # seq_mask
-        if padding_mask is None:
-            padding_mask = paddle.ones((batch_size, 1, seq_length, seq_length + past_length), dtype="bool")
-        if len(padding_mask.shape) == 2:
-            # from Tokenizer
-            padding_mask = (
-                padding_mask.unsqueeze(axis=[1, 2])
-                .expand([batch_size, 1, seq_length, seq_length + past_length])
-                .astype("bool")
-            )
-        elif len(padding_mask.shape) == 3:
-            # [batch_size,tgt_length, src_length] -> [batch_size, 1, tgt_length, src_length]
-            padding_mask = padding_mask.unsqueeze(1).astype("bool")
-        elif len(padding_mask.shape) == 4:
-            padding_mask = padding_mask.astype("bool")
-
-        casual_mask = casual_mask & padding_mask
-
-        return casual_mask
-
-    def init_weights(self, layer):
-        """Initialization hook"""
-        return None
+            # Concatenate ones for past attention
+            past_attention_mask = paddle.ones((batch_size, seq_length, past_length), dtype='float32')
+            full_attention_mask = paddle.concat([past_attention_mask, full_attention_mask], axis=-1)
+        
+        if padding_mask is not None:
+            # Apply padding mask
+            full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1).astype('float32')
+        
+        if not past_length and padding_mask is not None:
+            # Adjust full_attention_mask based on padding mask
+            full_attention_mask -= (padding_mask.unsqueeze(-1).astype('float32') - 1)
+        
+        # Convert to boolean mask (similar to < 0.5 in PyTorch)
+        full_attention_mask = (full_attention_mask < 0.5).astype('bool')
+        
+        # Add an extra dimension to full_attention_mask
+        full_attention_mask = full_attention_mask.unsqueeze(1)
+        
+        return full_attention_mask
 
     def get_position_ids(self, input_ids):
         batch_size, seq_length = input_ids.shape
@@ -730,6 +667,7 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
 
     @classmethod
     def _get_name_mappings(cls, config: ChatGLMv2Config) -> List[StateDictNameMapping]:
+        ########logger.info(f"确实调用我了")
         mappings = [
             "embedding.word_embeddings.weight",
             "rotary_pos_emb.inv_freq",
@@ -787,9 +725,18 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
                     ]
                 )
 
+        for mapping in mappings:
+            mapping[0] = "transformer." + mapping[0]
+            if len(mapping) > 1 and mapping[1] is not None:
+                mapping[1] = "chatglm_v2." + mapping[1]
         init_name_mappings(mappings)
-        return [StateDictNameMapping(*mapping) for mapping in mappings]
+        ########logger.info(f"cuowu{f1}")
+        ########logger.info(f"确实调用我了：{mappings}")
+        ########logger.info(f"确实调用我了：{[StateDictNameMapping(*mapping) for mapping in mappings]}")
 
+        f1 = mappings
+        return [StateDictNameMapping(*mapping) for mapping in mappings]
+    #我写的
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):
 
@@ -845,13 +792,6 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
             else:
                 return paddle.concat([merge_q, merge_k, merge_v], axis=-1)
 
-        fn = split_or_merge_func(
-            is_split=is_split,
-            tensor_parallel_degree=config.tensor_parallel_degree,
-            tensor_parallel_rank=config.tensor_parallel_rank,
-            num_attention_heads=config.num_attention_heads,
-        )
-
         def split_or_merge_mlp_weights(tensor_parallel_degree, tensor_parallel_rank, is_split, tensor):
             if is_split:
                 return split_mlp_weights(tensor_parallel_degree, tensor_parallel_rank, tensor)
@@ -886,32 +826,33 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
             else:
                 return paddle.concat([merge_ffn_fc, merge_gate], axis=-1)
 
+
+        fn = split_or_merge_func(
+            is_split=is_split,
+            tensor_parallel_degree=config.tensor_parallel_degree,
+            tensor_parallel_rank=config.tensor_parallel_rank,
+            num_attention_heads=config.num_attention_heads,#这个要注意
+        )
+
         def get_tensor_parallel_split_mappings(num_hidden_layers):
             final_actions = {}
             base_actions = {
                 # Column Linear
-                "output_layer.weight": partial(fn, is_column=True),
+                #"output_layer.weight": partial(fn, is_column=True),
                 "encoder.layers.0.mlp.dense_h_to_4h.weight": partial(
                     split_or_merge_mlp_weights, config.tensor_parallel_degree, config.tensor_parallel_rank, is_split
                 ),
                 "encoder.layers.0.self_attention.query_key_value.bias": partial(
-                    split_or_merge_qkv_weights,
-                    config.tensor_parallel_degree,
-                    config.tensor_parallel_rank,
-                    config.hidden_size,
-                    is_split,
+                    split_or_merge_qkv_weights, config.tensor_parallel_degree, config.tensor_parallel_rank, config.hidden_size, is_split
                 ),
                 "encoder.layers.0.self_attention.query_key_value.weight": partial(
-                    split_or_merge_qkv_weights,
-                    config.tensor_parallel_degree,
-                    config.tensor_parallel_rank,
-                    config.hidden_size,
-                    is_split,
+                    split_or_merge_qkv_weights, config.tensor_parallel_degree, config.tensor_parallel_rank, config.hidden_size, is_split
                 ),
                 # Row Linear
                 "embedding.word_embeddings.weight": partial(fn, is_column=False),
                 "encoder.layers.0.self_attention.dense.weight": partial(fn, is_column=False),
                 "encoder.layers.0.mlp.dense_4h_to_h.weight": partial(fn, is_column=False),
+
             }
             for key, action in base_actions.items():
                 if "layers.0." in key:
@@ -923,6 +864,7 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
 
         mappings = get_tensor_parallel_split_mappings(config.num_hidden_layers)
 
+
         return mappings
 
 
@@ -931,26 +873,72 @@ class Embedding(nn.Layer):
 
     def __init__(self, config: ChatGLMv2Config):
         super(Embedding, self).__init__()
-        self.config = config
+
         self.hidden_size = config.hidden_size
-        if config.tensor_parallel_degree > 1:
+        self.config = config
+        self.fp32_residual_connection = config.fp32_residual_connection
+        if self.config.tensor_parallel_degree > 1:
             self.word_embeddings = fleet.meta_parallel.VocabParallelEmbedding(
-                config.padded_vocab_size, self.hidden_size
+                config.vocab_size,
+                config.hidden_size,
+                weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
             )
         else:
-            self.word_embeddings = nn.Embedding(config.padded_vocab_size, self.hidden_size)
-        self.fp32_residual_connection = config.fp32_residual_connection
+            self.word_embeddings = nn.Embedding(
+                config.vocab_size, 
+                self.hidden_size,
+                weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
+                )
 
     def forward(self, input_ids):
         # Embeddings.
         embeddings = self.word_embeddings(input_ids)
         # Data format change to avoid explicit tranposes
         # [batch_size, seq_length, hidden_size] --> [seq_length, batch_size, hidden_size].
-        embeddings = embeddings.transpose([1, 0, 2])
+        embeddings = embeddings.transpose([1, 0, 2]).contiguous()
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.fp32_residual_connection:
             embeddings = embeddings.astype("float32")
+        #logger.info(f"Embedding_input:{input_ids}")
+        #logger.info(f"Embedding_output{embeddings}")
         return embeddings
+    
+def parallel_matmul(lm_output, logit_weights, parallel_output):
+    hcg = fleet.get_hybrid_communicate_group()
+    model_parallel_group = hcg.get_model_parallel_group()
+    world_size = hcg.get_model_parallel_world_size()
+
+    if world_size > 1:
+        # _c_identity is backwards is reduce
+        input_parallel = paddle.distributed.collective._c_identity(lm_output, group=model_parallel_group)
+
+        logits = paddle.matmul(input_parallel, logit_weights, transpose_y=True)
+
+        if parallel_output:
+            return logits
+
+        # _c_concat has not grad backwards
+        return paddle.distributed.collective._c_concat(logits, group=model_parallel_group)
+    else:
+        logits = paddle.matmul(lm_output, logit_weights, transpose_y=True)
+        return logits
+    
+class ChatGLMv2Head(nn.Layer):
+    def __init__(self, config, embedding_weights=None):
+        super(ChatGLMv2Head, self).__init__()
+        self.decoder_weight = (
+            self.create_parameter(shape=[config.vocab_size, config.hidden_size], dtype='float16')
+            if embedding_weights is None
+            else embedding_weights
+        )
+        self.config = config
+
+    def forward(self, hidden_states):
+        # if self.config.tensor_parallel_degree > 1:
+        #     logits = parallel_matmul(hidden_states, self.decoder_weight, self.config.tensor_parallel_output)
+        # else:
+        logits = F.linear(hidden_states, self.decoder_weight.T)
+        return logits
 
 
 @register_base_model
@@ -958,10 +946,12 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
     def __init__(self, config: ChatGLMv2Config, empty_init=True):
         super().__init__(config)
         self.embedding = Embedding(config)
-        self.config = config
-
+        self.num_layers = config.num_hidden_layers
         # Rotary positional embeddings
-        self.max_sequence_length = config.max_sequence_length
+        self.max_sequence_length = 2048
+        #self.max_sequence_length = config.max_sequence_length
+        self.multi_query_group_num = config.multi_query_group_num
+        self.kv_channels = config.kv_channels
         rotary_dim = (
             config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
         )
@@ -975,19 +965,21 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
         else:
             self.rotary_pos_emb = RotaryEmbedding(rotary_dim // 2)
         self.encoder = GLMTransformer(config)
-        if config.tensor_parallel_degree > 1:
-            self.output_layer = nn.Linear(
-                config.hidden_size, config.padded_vocab_size // config.tensor_parallel_degree, bias_attr=False
-            )
-        else:
-            self.output_layer = nn.Linear(config.hidden_size, config.padded_vocab_size, bias_attr=False)
-        self.apply(self.init_weights)
+        # if config.tensor_parallel_degree > 1:
+        #     self.output_layer = fleet.meta_parallel.ColumnParallelLinear(
+        #         config.hidden_size, config.padded_vocab_size, has_bias=False, gather_output=True
+        #     )
+        # else:
+        self.output_layer = nn.Linear(config.hidden_size, config.padded_vocab_size, bias_attr=False)
+
+        
 
     def get_input_embeddings(self):
         return self.embedding.word_embeddings
 
     def set_input_embeddings(self, value):
         self.embedding.word_embeddings = value
+
 
     def forward(
         self,
@@ -1000,24 +992,24 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ):
+    ):  
+        ########logger.info(f"1_input_ids:{input_ids}")
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         batch_size, seq_length = input_ids.shape
-
+        ##logger.info(f"Rotary_full_mask{full_attention_mask}")
+        ##logger.info(f"Rotary_mask{attention_mask}")
+        ##logger.info(f"Rotary_past_key_values{past_key_values}")
+        ##logger.info(f"seq_length{seq_length}")
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
-
-        if self.config.sequence_parallel:
-            seq_length, batch_size, hidden_size = inputs_embeds.shape
-            inputs_embeds = paddle.reshape_(inputs_embeds, [batch_size * seq_length, hidden_size])
-            # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
-            inputs_embeds = ScatterOp.apply(inputs_embeds)
-
-        full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
+        if full_attention_mask is None:
+                    if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
+                        full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
+                        ##logger.info(f"after_Rotary_full_mask{full_attention_mask}")
 
         # Rotary positional embeddings
         if self.config.use_long_sequence_strategies:
@@ -1033,7 +1025,9 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
         else:
             rotary_pos_emb = rotary_pos_emb[None, :seq_length]
 
-        rotary_pos_emb = rotary_pos_emb.transpose([1, 0, 2, 3])
+        rotary_pos_emb = rotary_pos_emb.transpose([1, 0, 2, 3]).contiguous()
+        #logger.info(f"rotary_pos_emb{rotary_pos_emb}")
+
 
         # Run encoder.
         hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder(
@@ -1063,10 +1057,11 @@ class ChatGLMv2PretrainingCriterion(nn.Layer):
     def __init__(self, config):
         super(ChatGLMv2PretrainingCriterion, self).__init__()
         self.config = config
-        if config.tensor_parallel_degree > 1 and config.tensor_parallel_output:
-            self.loss_func = fleet.meta_parallel.ParallelCrossEntropy()
-        else:
-            self.loss_func = paddle.nn.CrossEntropyLoss(reduction="none")
+        # if config.tensor_parallel_degree > 1 and config.tensor_parallel_output:
+        #     self.loss_func = fleet.meta_parallel.ParallelCrossEntropy()
+        # else:
+        self.loss_func = paddle.nn.CrossEntropyLoss()
+        ##logger.info(f"init ChatGLMv2PretrainingCriterion")
 
     def forward(self, prediction_scores, masked_lm_labels):
         """
@@ -1088,55 +1083,26 @@ class ChatGLMv2PretrainingCriterion(nn.Layer):
 
         """
         with paddle.amp.auto_cast(False):
-            loss_mask = (masked_lm_labels != -100).astype("float32")
-            reshaped_logits = prediction_scores.reshape([-1, prediction_scores.shape[-1]]).astype("float32")
-            reshaped_labels = masked_lm_labels.reshape([-1])
-            loss = self.loss_func(reshaped_logits, reshaped_labels)
-            loss = paddle.sum(loss.reshape([-1]).cast(paddle.float32) * loss_mask.reshape([-1]).cast(paddle.float32))
-            loss = loss / loss_mask.sum()
+            ##logger.info(f"forward ChatGLMv2PretrainingCriterion")
+            shift_logits = prediction_scores[:, :-1, :].contiguous()
+            shift_labels = masked_lm_labels[:, 1:].contiguous()
+            shift_logits = shift_logits.reshape([-1, shift_logits.shape[-1]])
+            shift_labels = shift_labels.reshape([-1])
+            shift_logits = shift_logits[shift_labels != -100]
+            shift_labels = shift_labels[shift_labels != -100]
+            #logger.info(f"shift_logits{shift_logits}")
+            #logger.info(f"shift_labels{shift_labels}")
+            loss = self.loss_func(shift_logits, shift_labels)            
+            ########logger.info(F"loss{loss}")
         return loss
-
-
-class Chatglmv2LMHead(nn.Layer):
-    def __init__(self, config: ChatGLMv2Config, embedding_weights=None):
-        super(Chatglmv2LMHead, self).__init__()
-        if embedding_weights is not None:
-            self.decoder_weight = embedding_weights
-        else:
-            if config.tensor_parallel_degree > 1:
-                vocab_size = config.vocab_size // config.tensor_parallel_degree
-            else:
-                vocab_size = config.vocab_size
-
-            if vocab_size != config.vocab_size:
-                with get_rng_state_tracker().rng_state():
-                    self.decoder_weight = self.create_parameter(
-                        shape=[config.hidden_size, vocab_size],
-                        dtype=paddle.get_default_dtype(),
-                    )
-            else:
-                self.decoder_weight = self.create_parameter(
-                    shape=[config.hidden_size, vocab_size], dtype=paddle.get_default_dtype()
-                )
-        self.config = config
-
-    def forward(self, hidden_states, return_last_logit=False):
-        if return_last_logit:
-            hidden_states = hidden_states[-1:]
-        if self.config.sequence_parallel:
-            hidden_states = GatherOp.apply(hidden_states)
-            hidden_states = paddle.reshape_(hidden_states, [self.config.seq_length, -1, self.config.hidden_size])
-        logits = parallel_matmul(hidden_states, self.decoder_weight, self.config.tensor_parallel_output)
-        return logits.transpose([1, 0, 2])
-
-
+    
 class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
     def __init__(self, config: ChatGLMv2Config):
         super().__init__(config)
         self.max_sequence_length = config.max_sequence_length
         self.chatglm_v2 = ChatGLMv2Model(config)
+        # self.lm_head = ChatGLMv2Head(config, self.chatglm_v2.embedding.word_embeddings.weight)
         self.criterion = ChatGLMv2PretrainingCriterion(config)
-        self.config = config
 
     def reorder_cache(self, cache: paddle.Tensor, beam_idx):
         cache = map_structure(lambda x: paddle.index_select(x, beam_idx, axis=1), cache)
@@ -1211,10 +1177,20 @@ class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         return_last_logit: Optional[bool] = False,
-    ):
+    ):  
+        ##logger.info(f"input_ids :{input_ids}")
+        ##logger.info(f"position_ids:{position_ids}")
+        ##logger.info(f"attention_mask:{attention_mask}")
+        ##logger.info(f"past_key_values:{past_key_values}")
+        ##logger.info(f"inputs_embeds:{inputs_embeds}")
+        ##logger.info(f"labels:{labels}")
+        ##logger.info(f"use_cache:{use_cache}")
+        ##logger.info(f"output_hidden_states:{output_hidden_states}")
+        ##logger.info(f"return_dict:{return_dict}")
+        ##logger.info(f"return_last_logit:{return_last_logit}")
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        
         transformer_outputs = self.chatglm_v2(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1228,26 +1204,21 @@ class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
 
         hidden_states = transformer_outputs[0]
 
-        if self.config.sequence_parallel:
-            hidden_states = GatherOp.apply(hidden_states)
-            seq_length = self.config.seq_length
-            hidden_states = hidden_states.reshape([seq_length, -1, self.config.hidden_size])
         if return_last_logit:
             hidden_states = hidden_states[-1:]
-        if self.config.tensor_parallel_degree > 1:
-            lm_logits = parallel_matmul(
-                hidden_states, self.chatglm_v2.output_layer.weight, self.config.tensor_parallel_output
-            )
-        else:
-            lm_logits = self.chatglm_v2.output_layer(hidden_states)
-        lm_logits = lm_logits.transpose([1, 0, 2])
-        # shape = [batch_size, seq_length, vocab_size]
+        lm_logits = self.chatglm_v2.output_layer(hidden_states)
+
+        lm_logits = lm_logits.transpose([1, 0, 2]).contiguous().astype("float32")
+
+
+
         loss = None
         if labels is not None:
             loss = self.criterion(lm_logits, labels)
             lm_logits = lm_logits.astype(hidden_states.dtype)
             loss = loss.astype(hidden_states.dtype)
-
+        # lm_logits = lm_logits.astype("float16")
+        # loss = loss.astype("float16")
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -1259,3 +1230,4 @@ class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+    

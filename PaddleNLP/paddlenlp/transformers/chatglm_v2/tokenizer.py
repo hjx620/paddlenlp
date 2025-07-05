@@ -19,9 +19,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from sentencepiece import SentencePieceProcessor
-
+import json
 from .. import PretrainedTokenizer
 from ..tokenizer_utils_base import BatchEncoding, PaddingStrategy
+import logging
+logger = logging.getLogger('tokenizer')
+logger.setLevel(logging.INFO)
 
 
 class SPTokenizer:
@@ -85,7 +88,19 @@ class SPTokenizer:
         return t
 
     def decode(self, t: List[int]) -> str:
-        return self.sp_model.decode(t)
+        text, buffer = "", []
+        for token in t:
+            if token in self.index_special_tokens:
+                if buffer:
+                    text += self.sp_model.decode(buffer)
+                    buffer = []
+                text += self.index_special_tokens[token]
+            else:
+                buffer.append(token)
+        if buffer:
+            text += self.sp_model.decode(buffer)
+        return text
+        #return self.sp_model.decode(t)
 
     def decode_tokens(self, tokens: List[str]) -> str:
         text = self.sp_model.DecodePieces(tokens)
@@ -99,7 +114,9 @@ class SPTokenizer:
 
     def convert_id_to_token(self, index):
         """Converts an index (integer) in a token (str) using the vocab."""
-        if index in self.index_special_tokens or index in [self.eos_id, self.bos_id, self.pad_id] or index < 0:
+        if index in self.index_special_tokens:
+            return self.index_special_tokens[index]
+        if index > self.sp_model.vocab_size() or index in [self.eos_id, self.bos_id, self.pad_id] or index < 0:
             return ""
         return self.sp_model.IdToPiece(index)
 
@@ -117,7 +134,6 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
     def __init__(self, vocab_file, padding_side="left", encode_special_tokens=True, **kwargs):
         super().__init__(padding_side=padding_side, **kwargs)
         self.name = "ChatGLMv2Tokenizer"
-
         self.vocab_file = vocab_file
         self.tokenizer = SPTokenizer(vocab_file)
         self.special_tokens = {
@@ -133,22 +149,68 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
             return self.special_tokens[token]
         assert token in self.tokenizer.special_tokens, f"{token} is not a special token for {self.name}"
         return self.tokenizer.special_tokens[token]
+    
+    # @property
+    # def unk_token(self) -> str:
+    #     return "<unk>"
+    #     # return self.tokenizer.sp_model.IdToPiece(self.get_command("<unk>"))
+
+    # @property
+    # def pad_token(self) -> str:
+    #     return "<unk>"
+    #     # return self.tokenizer.sp_model.IdToPiece(self.get_command("<pad>"))
+    
+    # @property
+    # def eos_token(self) -> str:
+    #     return "</s>"
+    #     # return self.tokenizer.sp_model.IdToPiece(self.get_command("<eos>"))
+    @property
+    def unk_token(self) -> str:
+        return self.tokenizer.sp_model.IdToPiece(self.get_command("<unk>"))
 
     @property
     def pad_token(self) -> str:
-        return "<unk>"
-
-    @property
-    def pad_token_id(self):
-        return self.get_command("<pad>")
+        return self.tokenizer.sp_model.IdToPiece(self.get_command("<pad>"))
 
     @property
     def eos_token(self) -> str:
-        return "</s>"
+        return self.tokenizer.sp_model.IdToPiece(self.get_command("<eos>"))
+    
+    @property
+    def unk_token_id(self) -> int:
+        return self.get_command("<unk>")
+
+    @property
+    def pad_token_id(self) -> int:
+        return self.get_command("<pad>")
 
     @property
     def eos_token_id(self):
         return self.get_command("<eos>")
+
+    # @property
+    # def pad_token_id(self):
+    #     return self.get_command("<pad>")
+
+    # @property
+    # def eos_token(self) -> str:
+    #     return "</s>"
+
+    # @property
+    # def eos_token_id(self):
+    #     return self.get_command("<eos>")
+
+    @unk_token.setter
+    def unk_token(self, value):
+        logger.warning("Setting unk_token is not supported, use the default one.")
+
+    @pad_token.setter
+    def pad_token(self, value):
+        logger.warning("Setting pad_token is not supported, use the default one.")
+
+    @eos_token.setter
+    def eos_token(self, value):
+        logger.warning("Setting eos_token is not supported, use the default one.")
 
     @property
     def vocab_size(self):
@@ -204,14 +266,34 @@ class ChatGLMv2Tokenizer(PretrainedTokenizer):
         prefix_tokens = [self.get_command("[gMASK]"), self.get_command("sop")]
         return prefix_tokens
 
-    def build_prompt(self, query, history=None):
+    # def build_prompt(self, query, history=None):
+    #     if history is None:
+    #         history = []
+    #     prompt = ""
+    #     for i, (old_query, response) in enumerate(history):
+    #         prompt += "[Round {}]\n\n问：{}\n\n答：{}\n\n".format(i + 1, old_query, response)
+    #     prompt += "[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
+    #     return prompt
+    
+    def build_single_message(self, role, metadata, message):
+        assert role in ["system", "user", "assistant", "observation"], role
+        role_tokens = [self.get_command(f"<|{role}|>")] + self.tokenizer.encode(f"{metadata}\n")
+        message_tokens = self.tokenizer.encode(message)
+        tokens = role_tokens + message_tokens
+        return tokens
+
+    def build_chat_input(self, query, history=None, role="user"):
         if history is None:
             history = []
-        prompt = ""
-        for i, (old_query, response) in enumerate(history):
-            prompt += "[Round {}]\n\n问：{}\n\n答：{}\n\n".format(i + 1, old_query, response)
-        prompt += "[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
-        return prompt
+        input_ids = []
+        for item in history:
+            content = item["content"]
+            if item["role"] == "system" and "tools" in item:
+                content = content + "\n" + json.dumps(item["tools"], indent=4, ensure_ascii=False)
+            input_ids.extend(self.build_single_message(item["role"], item.get("metadata", ""), content))
+        input_ids.extend(self.build_single_message(role, "", query))
+        input_ids.extend([self.get_command("<|assistant|>")])
+        return self.batch_encode_plus([input_ids], return_tensors="pt", is_split_into_words=True)
 
     def build_inputs_with_special_tokens(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None

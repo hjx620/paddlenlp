@@ -41,7 +41,7 @@ class ChatGLMv2Config(PretrainedConfig):
         hidden_dropout=0.0,
         attention_dropout=0.0,
         layernorm_epsilon=1e-5,
-        use_cache=True,
+        use_cache=False,
         rmsnorm=True,
         apply_residual_connection_post_layernorm=False,
         post_layer_norm=True,
@@ -55,10 +55,20 @@ class ChatGLMv2Config(PretrainedConfig):
         fp32_residual_connection=False,
         eos_token_id=2,
         pad_token_id=0,
+        use_flash_attention=False,
         long_sequence_strategy_type=None,
         long_sequence_strategy_name=None,
         long_sequence_init_args=None,
         use_long_sequence_strategies=False,
+        use_recompute=False,
+        recompute_granularity="full",
+        pp_recompute_interval=1,
+        no_recompute_layers=None,
+        fuse_attention_qkv=False,
+        fuse_attention_ffn=False,
+        use_fused_rms_norm=False,
+        use_fused_rope=False,
+        alibi=False,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -83,8 +93,20 @@ class ChatGLMv2Config(PretrainedConfig):
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = attention_softmax_in_fp32
         self.fp32_residual_connection = fp32_residual_connection
-
+        self.use_flash_attention = use_flash_attention
         self.long_sequence_strategy_type = long_sequence_strategy_type
         self.long_sequence_strategy_name = long_sequence_strategy_name
         self.long_sequence_init_args = {} if long_sequence_init_args is None else long_sequence_init_args
         self.use_long_sequence_strategies = use_long_sequence_strategies
+        self.use_recompute = use_recompute
+        self.recompute_granularity = recompute_granularity
+        self.pp_recompute_interval = pp_recompute_interval
+        self.no_recompute_layers= no_recompute_layers
+        self.fuse_attention_qkv = fuse_attention_qkv
+
+        self.fuse_attention_ffn = fuse_attention_ffn
+        self.use_fused_rms_norm = use_fused_rms_norm
+        self.alibi = alibi
+        self.dtype = "float32"
+
+        self.use_fused_rope = use_fused_rope

@@ -65,7 +65,7 @@ from paddlenlp.utils.llm_utils import (
 )
 from paddlenlp.utils.log import logger
 from paddlenlp.utils.tools import get_env_device
-
+#paddle.set_default_dtype("float16")
 # Fine-tune Environment Variables to support sharding stage1 overlap optimization.
 os.environ["USE_CASUAL_MASK"] = "False"
 
@@ -125,6 +125,7 @@ def main():
             raise ValueError("Please specific dtype: --fp16 or --bf16")
     else:
         dtype = "float32"
+    #dtype = "float16"
     quantization_config = dict(
         weight_quantize_algo=model_args.weight_quantize_algo,
         weight_blocksize=model_args.weight_blocksize,
@@ -340,10 +341,11 @@ def main():
         )
         train_ds = train_ds.skip(consumed_samples)
 
-    if training_args.pipeline_parallel_degree > 1:
-        from utils.data import convert_example_common
-
-        trans_func = partial(convert_example_common, tokenizer=tokenizer, data_args=data_args)
+    if training_args.pipeline_parallel_degree > 1 :
+        # from utils.data import convert_example_common
+        # trans_func = partial(convert_example_common, tokenizer=tokenizer, data_args=data_args)
+        from utils.data import process_example
+        trans_func = partial(process_example, tokenizer=tokenizer, data_args=data_args)
     else:
         trans_func = partial(get_convert_example(model), tokenizer=tokenizer, data_args=data_args)
 
@@ -537,7 +539,7 @@ def main():
         metrics = compute_metrics_do_generation
     else:
         metrics = compute_metrics
-
+    logger.info(f"model_config{model}")
     trainer = CausalLMTrainer(
         model=model,
         args=training_args,

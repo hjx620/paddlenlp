@@ -15,6 +15,7 @@
 import numpy as np
 
 from paddlenlp.peft import LoRAModel, PrefixModelForCausalLM
+from paddlenlp.utils.log import logger
 
 
 def convert_multi_rounds_to_single_round(example, tokenizer):
@@ -43,8 +44,9 @@ def get_convert_example(model):
 
     if base_model_prefix == "chatglm":
         return convert_example_chatglm
+    elif base_model_prefix == "chatglm_v2":
+        return process_example
     elif base_model_prefix in [
-        "chatglm_v2",
         "llama",
         "bloom",
         "opt",
@@ -68,6 +70,81 @@ def get_convert_example(model):
 class DataFormatError(ValueError):
     pass
 
+def process_example(
+        example,
+        tokenizer,
+        data_args,
+        is_test=True, intokens=False,
+        zero_padding=False, flash_mask=False
+) -> dict[str, list]:
+    # logger.info(f"example{example}")
+    max_input_length = data_args.src_length
+    max_output_length = data_args.max_length
+    exampleed_tools = example.get('tools', None)
+    #source = example['src']
+    #target = example['tgt']
+    exampleed_conv = example['conversations']
+    #exampleed_conv = [source] + [target]
+    exampleed_input_ids = []
+    exampleed_labels = []
+    # logger.info(f"example{exampleed_tools}")
+    #logger.info(f"example{exampleed_conv}")
+    # logger.info(f"{type(exampleed_conv)}")
+    if exampleed_tools is None:
+        exampleed_tools = [None] * len(exampleed_conv)
+    
+    input_ids, loss_masks = [
+        tokenizer.get_command('[gMASK]'),
+        tokenizer.get_command('sop'),
+        ], [False, False]
+
+
+
+    for tools, message in zip(exampleed_tools, exampleed_conv):
+        # logger.info(f"message{message}")
+        if tools is not None:
+            raise NotImplementedError()
+        # for message , value in conv:
+        #     logger.info(f"message   {message}")
+        #     logger.info(f"message   {type(message)}")
+        if message['role'] in ['system', "user"]:
+            loss_mask_val = False
+        else:
+            loss_mask_val = True
+
+        if message['role'] == 'tool':
+            raise NotImplementedError()
+        else:
+            new_input_ids = tokenizer.build_single_message(
+                message["role"], '', message["content"]
+            )
+            new_loss_masks = [loss_mask_val] * len(new_input_ids)
+
+        input_ids += new_input_ids
+        loss_masks += new_loss_masks
+
+    input_ids.append(tokenizer.eos_token_id)
+    loss_masks = [False, *loss_masks]
+    labels = []
+    for input_id, mask in zip(input_ids, loss_masks):
+        if mask:
+            labels.append(input_id)
+        else:
+            labels.append(-100)
+    max_length = max_input_length + max_output_length + 1
+    # exampleed_input_ids.append(input_ids[:max_length])
+    # exampleed_labels.append(labels[:max_length])
+    # logger.info(f"max_l{max_length}")
+    # logger.info(f"input:{input_ids[:max_length]}")
+    # logger.info(f"labels{labels[:max_length]}")
+    features = {"input_ids": input_ids[:max_length], "labels": labels[:max_length]}
+    seq_length = len(input_ids[:max_length])
+    if zero_padding:
+        if flash_mask:
+            features["attn_mask_startend_row_indices"] = [seq_length] * seq_length
+        else:
+            features["attention_mask"] = np.tri(seq_length, seq_length, dtype=bool)
+    return features
 
 def tokenize_example(tokenizer, example, data_args):
     if "src" in example and "tgt" in example:
