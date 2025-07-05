@@ -25,6 +25,11 @@ from paddle.distributed.fleet.meta_parallel import (
 )
 
 from ...transformers import linear_utils
+import logging
+import numpy as np
+#paddle.set_default_dtype("float16")
+logger = logging.getLogger('auto_tuner')
+logger.setLevel(logging.INFO)
 
 ColumnSequenceParallelLinear = linear_utils.ColumnSequenceParallelLinear
 RowSequenceParallelLinear = linear_utils.RowSequenceParallelLinear
@@ -82,13 +87,19 @@ class LoRALinear(nn.Linear):
         # Actual trainable parameters
         self.lora_A = self.create_parameter(
             shape=[in_features, r],
-            dtype=self._dtype,
+            dtype="float32",
             is_bias=False,
-            default_initializer=nn.initializer.KaimingUniform(negative_slope=math.sqrt(5), nonlinearity="leaky_relu"),
+            #default_initializer=nn.initializer.KaimingUniform(negative_slope=math.sqrt(5), nonlinearity="leaky_relu"),
+            default_initializer=nn.initializer.Constant(value=-0.1),
         )
+        # lora_A_numpy = self.lora_A.numpy()
+        # np.save("lora_weights.npy",lora_A_numpy)
+        # print("保存")
+
         self.lora_B = self.create_parameter(
             shape=[r, out_features],
-            dtype=self._dtype,
+            #dtype=self._dtype,
+            dtype="float32",
             is_bias=False,
             attr=paddle.ParamAttr(
                 initializer=paddle.nn.initializer.Constant(value=0.0),
@@ -145,6 +156,7 @@ class LoRALinear(nn.Linear):
             self.merged = False
 
     def forward(self, input: paddle.Tensor, *args, **kwargs):
+        #logger.info(f"input:{input}")
         if not self.apply_pissa and self.pissa:
             self.pissa_init(self.r)
             self.apply_pissa = True
@@ -156,6 +168,9 @@ class LoRALinear(nn.Linear):
         else:
             result = F.linear(x=input, weight=self.weight, bias=self.bias, name=self.name)
             result += (self.lora_dropout(input) @ self.lora_A @ self.lora_B) * self.scaling
+        # logger.info(f"lora_A{self.lora_A}")
+        # logger.info(f"lora_B{self.lora_B}")
+        #logger.info(f"result:{result}")
         return result
 
     def extra_repr(self):
@@ -465,8 +480,10 @@ class ColumnParallelLoRALinear(ColumnParallelLinear):
             shape=[in_features, r],
             dtype=self._dtype,
             is_bias=False,
-            attr=lora_A_weight_attr,
+            # attr=lora_A_weight_attr,
+            default_initializer=nn.initializer.Constant(value=-0.1),
         )
+        
         self.lora_A.is_distributed = False
         self.lora_B = self.create_parameter(
             shape=[r, self.output_size_per_partition],
