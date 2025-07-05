@@ -124,6 +124,7 @@ class PrefixModelForCausalLM(paddle.nn.Layer):
             output = self.model(input_ids=input_ids, cache=past_key_values, **kwargs)
         else:
             raise NotImplementedError("Model does not support past_key_values either cache")
+        # logger.info(f"prefix{self.prefix_encoder.state_dict()}")
         return output
 
     def generate(self, **kwargs):
@@ -233,6 +234,7 @@ class PrefixModelForCausalLM(paddle.nn.Layer):
                 prefix_embedding = nn.Embedding(
                     self.prefix_config.num_prefix_tokens,
                     self.head_dim * self.num_heads * self.prefix_config.num_hidden_layers * 2,
+                    weight_attr=paddle.ParamAttr(initializer=nn.initializer.Constant(value=0.0)),
                 )
             prefix_encoder = nn.Sequential(prefix_embedding, prefix_dropout)
         return prefix_encoder
