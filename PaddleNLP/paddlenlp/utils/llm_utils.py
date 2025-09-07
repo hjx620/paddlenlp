@@ -123,17 +123,13 @@ def get_prefix_tuning_params(model):
 
 
 def get_lora_target_modules(model):
+    print(f"model.base_model_prefix 的值为: {model.base_model_prefix}")
     # Not yet support RowParallelLinear
     if model.base_model_prefix == "chatglm":
         target_modules = [".*query_key_value.*", ".*dense.*", ".*dense_h_to_4h.*", ".*dense_4h_to_h.*"]
     elif model.base_model_prefix == "chatglm_v2":
         target_modules = [
-            ".*query.*",
-            ".*key.*",
-            ".*value.*",
-            ".*dense.*",
-            ".*dense_h_to_4h.*",
-            ".*dense_4h_to_h.*",
+            ".*query_key_value.*",
         ]
     elif model.base_model_prefix == "gpt":
         target_modules = [
@@ -233,7 +229,10 @@ def get_lora_target_modules(model):
             ".*down_proj.*",
         ]
     else:
-        raise ValueError(f"Unknown base_model_prefix: {model.base_model_prefix}.")
+        # raise ValueError(f"Unknown base_model_prefix: {model.base_model_prefix}.")
+        target_modules = [
+            ".*query_key_value.*",
+        ]
     return target_modules
 
 
