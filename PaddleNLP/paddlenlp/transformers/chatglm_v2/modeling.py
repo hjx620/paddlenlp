@@ -200,7 +200,7 @@ class CoreAttention(nn.Layer):
         if full_attention_mask is None and attention_scores.shape[2] == attention_scores.shape[3]:
             # Create a lower triangular mask with ones
             tril_attention_mask = paddle.ones(
-                shape=[output_size[0], 1, output_size[2], output_size[3]],
+                shape=[output_size[0], output_size[1], output_size[2], output_size[3]],
                 dtype='bool'
             )
             # Make the mask lower triangular
@@ -214,7 +214,7 @@ class CoreAttention(nn.Layer):
                 full_attention_mask = paddle.where(full_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
             # Create a lower triangular mask with ones
             tril_attention_mask = paddle.ones(
-                shape=[output_size[0], 1, output_size[2], output_size[3]],
+                shape=[output_size[0], output_size[1], output_size[2], output_size[3]],
                 dtype='bool'
             )
             # Make the mask lower triangular
@@ -224,7 +224,6 @@ class CoreAttention(nn.Layer):
             tril_attention_mask = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
             full_attention_mask = full_attention_mask + tril_attention_mask
             attention_scores = attention_scores + full_attention_mask
-
         attention_probs = F.softmax(attention_scores, axis=-1)
         #attention_probs = F.softmax(attention_scores.astype("float32"), axis=-1)
         attention_probs = attention_probs.astype(value_layer.dtype)
@@ -633,8 +632,16 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
 
     def get_masks(self, input_ids, past_key_values, padding_mask=None):
         batch_size, seq_length = input_ids.shape
-        # Initialize the full attention mask with ones and set the lower triangular mask
-        full_attention_mask = paddle.ones((batch_size, seq_length, seq_length), dtype='float32')
+        # 获取当前设备的实际注意力头数（总头数 / 张量并行度）
+        num_attention_heads = self.config.num_attention_heads
+        tensor_parallel_degree = self.config.tensor_parallel_degree or 1
+        num_heads_per_device = num_attention_heads // tensor_parallel_degree
+
+        # 初始化掩码时使用拆分后的头数维度
+        full_attention_mask = paddle.ones(
+            (batch_size, num_heads_per_device, seq_length, seq_length),  # 第1维度改为拆分后的头数
+            dtype='float32'
+        )
         full_attention_mask = paddle.tril(full_attention_mask)
         
         past_length = 0
@@ -642,24 +649,19 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
             past_length = past_key_values[0][0].shape[0]
         
         if past_length:
-            # Concatenate ones for past attention
-            past_attention_mask = paddle.ones((batch_size, seq_length, past_length), dtype='float32')
+            past_attention_mask = paddle.ones(
+                (batch_size, num_heads_per_device, seq_length, past_length),  # 同样调整头数维度
+                dtype='float32'
+            )
             full_attention_mask = paddle.concat([past_attention_mask, full_attention_mask], axis=-1)
         
         if padding_mask is not None:
-            # Apply padding mask
             full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1).astype('float32')
         
         if not past_length and padding_mask is not None:
-            # Adjust full_attention_mask based on padding mask
             full_attention_mask -= (padding_mask.unsqueeze(-1).astype('float32') - 1)
         
-        # Convert to boolean mask (similar to < 0.5 in PyTorch)
         full_attention_mask = (full_attention_mask < 0.5).astype('bool')
-        
-        # Add an extra dimension to full_attention_mask
-        full_attention_mask = full_attention_mask.unsqueeze(1)
-        
         return full_attention_mask
 
     def get_position_ids(self, input_ids):
