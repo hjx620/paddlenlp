@@ -156,8 +156,6 @@ class ChatGLMv2EmbeddingPipe(nn.Layer):
         Returns:
             _type_: _description_
         """
-        ##logger.info(f"forward ChatGLMv2EmbeddingPipe")
-        ##logger.info(f"args{args}")
         input_ids, attention_mask, position_ids, past_key_values = parse_args1(args)
 
         hidden_states = self.word_embeddings(input_ids)
@@ -166,13 +164,7 @@ class ChatGLMv2EmbeddingPipe(nn.Layer):
         if self.fp32_residual_connection:
             hidden_states = hidden_states.astype("float32")
 
-        #logger.info(f"EmbeddingPipe")
-        #logger.info(f"hidden_states{hidden_states}")
-        #logger.info(f"input_ids{input_ids}")
-        #logger.info(f"attention_mask{attention_mask}")
-        #logger.info(f"position_ids{position_ids}")
-        #logger.info(f"past_key_values{past_key_values}")
-        return (hidden_states,input_ids,attention_mask, position_ids,past_key_values)
+        return (hidden_states, input_ids, attention_mask, position_ids, past_key_values)
     
 
 class LongSequenceStrategiesPipe(nn.Layer):
@@ -198,15 +190,13 @@ class LongSequenceStrategiesPipe(nn.Layer):
                 f"module '{import_class.__name__}' only supports the following classes: "
                 + ", ".join(m for m in all_strategy_classes)
             )
-        strategy_instance = strategy_class(**init_args)
+        strategy_instance = strategy_class(** init_args)
         self.strategy_instance = strategy_instance
 
 
     def forward(self, args):
 
-        # input_ids,embeddings,attention_mask, position_ids, past_key_values = parse_args(args)
-        hidden_states,input_ids,attention_mask, position_ids,past_key_values = args
-        #full_attention_mask = RotaryEmbeddingPipe.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
+        hidden_states, input_ids, attention_mask, position_ids, past_key_values = args
         full_attention_mask = None
         batch_size, seq_length = input_ids.shape
         # Rotary positional embeddings
@@ -226,11 +216,12 @@ class LongSequenceStrategiesPipe(nn.Layer):
         rotary_pos_emb = rotary_pos_emb.transpose([1, 0, 2, 3])
 
         #transformer
-        zero = paddle.zeros(full_attention_mask.shape, dtype=hidden_states.dtype)
-        neg_inf = paddle.full_like(full_attention_mask, paddle.finfo(hidden_states.dtype).min, dtype=hidden_states.dtype)
-        full_attention_mask = paddle.where(full_attention_mask, zero, neg_inf)
+        zero = paddle.zeros(full_attention_mask.shape, dtype=hidden_states.dtype) if full_attention_mask is not None else None
+        neg_inf = paddle.full_like(full_attention_mask, paddle.finfo(hidden_states.dtype).min, dtype=hidden_states.dtype) if full_attention_mask is not None else None
+        if full_attention_mask is not None:
+            full_attention_mask = paddle.where(full_attention_mask, zero, neg_inf)
 
-        return return_args(hidden_states,rotary_pos_emb,full_attention_mask)
+        return return_args(hidden_states, rotary_pos_emb, full_attention_mask)
     
 class RotaryEmbeddingPipe(RotaryEmbedding):
     """Extends Embeddings to forward attention_mask through the pipeline."""
@@ -238,64 +229,33 @@ class RotaryEmbeddingPipe(RotaryEmbedding):
     def __init__(self, config, dim, original_impl=False):
         super().__init__(dim, original_impl)
         self.config = config
-        # h
-        self.max_sequence_length = 2048
-        #config.max_sequence_length
+        self.max_sequence_length = 2048  # config.max_sequence_length
     
-    # def get_masks(self, input_ids, past_key_values, padding_mask=None):
-    #     batch_size, seq_length = input_ids.shape
-
-    #     # casual mask
-    #     casual_mask = paddle.tril(paddle.ones([batch_size, 1, seq_length, seq_length])).astype("bool")
-    #     past_length = 0
-    #     if past_key_values:
-    #         past_length = past_key_values[0][0].shape[0]
-    #     if past_length:
-    #         casual_mask = paddle.concat(
-    #             [paddle.ones([batch_size, 1, seq_length, past_length], dtype="bool"), casual_mask], axis=-1
-    #         )
-
-    #     # seq_mask
-    #     if padding_mask is None:
-    #         padding_mask = paddle.ones((batch_size, 1, seq_length, seq_length + past_length), dtype="bool")
-    #     if len(padding_mask.shape) == 2:
-    #         # from Tokenizer
-    #         padding_mask = (
-    #             padding_mask.unsqueeze(axis=[1, 2])
-    #             .expand([batch_size, 1, seq_length, seq_length + past_length])
-    #             .astype("bool")
-    #         )
-    #     elif len(padding_mask.shape) == 3:
-    #         # [batch_size,tgt_length, src_length] -> [batch_size, 1, tgt_length, src_length]
-    #         padding_mask = padding_mask.unsqueeze(1).astype("bool")
-    #     elif len(padding_mask.shape) == 4:
-    #         padding_mask = padding_mask.astype("bool")
-
-    #     casual_mask = casual_mask & padding_mask
-
-    #     return casual_mask
-    def get_masks(self,valid_length_mask, seq_length, num_heads):
+    def get_masks(self, valid_length_mask, seq_length, num_heads):
         """
         Generate attention mask based on valid length mask.
         
         Args:
-            valid_length_mask (Tensor): Tensor of shape [1, seq_length] indicating valid positions (1) and invalid positions (0).
+            valid_length_mask (Tensor): Tensor of shape [batch_size, seq_length] indicating valid positions (1) and invalid positions (0).
             seq_length (int): The total sequence length after padding.
             num_heads (int): The number of attention heads.
         
         Returns:
-            attention_mask (Tensor): Tensor of shape [1, num_heads, seq_length, seq_length] for attention computation.
+            attention_mask (Tensor): Tensor of shape [batch_size, num_heads, seq_length, seq_length] for attention computation.
         """
-        # Expand valid_length_mask to [1, seq_length, seq_length]
-        valid_length_mask = valid_length_mask.unsqueeze(1)
-        valid_length_mask = valid_length_mask.expand([1, seq_length, seq_length])
+        # 获取batch size
+        batch_size = valid_length_mask.shape[0]
         
-        # Create attention mask by setting invalid positions to a large negative value
+        # 扩展valid_length_mask到[batch_size, seq_length, seq_length]
+        valid_length_mask = valid_length_mask.unsqueeze(1)
+        valid_length_mask = valid_length_mask.expand([batch_size, seq_length, seq_length])
+        
+        # 将无效位置设置为较大的负值来创建注意力掩码
         attention_mask = (1.0 - valid_length_mask) * -1e9
         
-        # Expand to [1, num_heads, seq_length, seq_length]
+        # 扩展到[batch_size, num_heads, seq_length, seq_length]
         attention_mask = attention_mask.unsqueeze(1)
-        attention_mask = attention_mask.expand([1, num_heads, seq_length, seq_length])
+        attention_mask = attention_mask.expand([batch_size, num_heads//self.config.tensor_parallel_degree, seq_length, seq_length])
         
         return attention_mask
 
@@ -309,15 +269,14 @@ class RotaryEmbeddingPipe(RotaryEmbedding):
             _type_: _description_
         """
 
-        # input_ids,embeddings,attention_mask, position_ids, past_key_values = parse_args(args)
-        hidden_states,input_ids,attention_mask, position_ids,past_key_values = args
-        ##logger.info(f"forward RotaryEmbeddingPipe")
+        hidden_states, input_ids, attention_mask, position_ids, past_key_values = args
         batch_size, seq_length = input_ids.shape
         full_attention_mask = None
+        
         if full_attention_mask is None:
-                    if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
-                        full_attention_mask = self.get_masks(attention_mask,seq_length,32)
-        #full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
+            if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
+                # 使用配置中的注意力头数，而不是硬编码的32
+                full_attention_mask = self.get_masks(attention_mask, seq_length, self.config.num_attention_heads)
         
         # Rotary positional embeddings
         if self.config.use_long_sequence_strategies:
@@ -335,45 +294,35 @@ class RotaryEmbeddingPipe(RotaryEmbedding):
 
         rotary_pos_emb = rotary_pos_emb.transpose([1, 0, 2, 3]).contiguous()
 
-        #transformer
-        # zero = paddle.zeros(full_attention_mask.shape, dtype=hidden_states.dtype)
-        # neg_inf = paddle.full_like(full_attention_mask, paddle.finfo(hidden_states.dtype).min, dtype=hidden_states.dtype)
-        # full_attention_mask = paddle.where(full_attention_mask, zero, neg_inf)
-        #logger.info(f"RotaryEmbeddingPipe")
-        #logger.info(f"hidden_states{hidden_states}")
-        #logger.info(f"full_attention_mask{full_attention_mask}")
-        #logger.info(f"rotary_pos_emb{rotary_pos_emb}")
-
-        return return_args(hidden_states,rotary_pos_emb,full_attention_mask)
-
-        
+        return return_args(hidden_states, rotary_pos_emb, full_attention_mask)
 
 
 class GLMBlockPipe(GLMBlock):
-    # def __init__(self, config,layer_number,layerwise_recompute: bool = False):
-    #     super().__init__(config, layer_number,layerwise_recompute)1
     @paddle.jit.not_to_static
     def recompute_training(
         self,
-        layer_module: nn.Layer,
+        layer_forward,  # 接收父类的forward方法而不是super对象
         hidden_states: paddle.Tensor,
         attention_mask: paddle.Tensor,
-        rotary_embeds: paddle.Tensor,
+        rotary_pos_emb: paddle.Tensor,
         kv_cache: paddle.Tensor,
         use_cache: bool,
     ):
-
-        def create_custom_forward(module):
+        """
+        修复recompute_training方法，接收父类的forward方法而不是super对象
+        """
+        def create_custom_forward(forward_func):
             def custom_forward(*inputs):
-                return module(*inputs)
-
+                # 调用父类的forward方法
+                return forward_func(*inputs)
             return custom_forward
 
+        # 使用父类的forward方法创建自定义函数
         hidden_states, kv_cache = recompute(
-            create_custom_forward(layer_module),
+            create_custom_forward(layer_forward),
             hidden_states,
             attention_mask,
-            rotary_embeds,
+            rotary_pos_emb,
             kv_cache,
             use_cache,
             use_reentrant=self.config.recompute_use_reentrant,
@@ -381,37 +330,32 @@ class GLMBlockPipe(GLMBlock):
         return hidden_states, kv_cache
 
     def forward(self, args):
-        ##logger.info(f"forward GLMBlockPipe")
         kv_caches = self.kv_caches
-        use_cache = self.config.use_cache#重要
+        use_cache = self.config.use_cache
 
-
-        hidden_states,  rotary_pos_emb ,full_attention_mask = parse_args(args)#很多问题
+        hidden_states, rotary_pos_emb, full_attention_mask = parse_args(args)
         if not kv_caches:
             kv_caches = [None for _ in range(self.config.num_hidden_layers)]
 
-        ##logger.info(f"self.layer_number:{self.layer_number}")
-        # if output_hidden_states:
-        #     all_hidden_states = all_hidden_states + (hidden_states,)
         if self.enable_recompute and not hidden_states.stop_gradient:
+            # 传递父类的forward方法而不是super对象
             hidden_states, kv_cache = self.recompute_training(
-                super(),
+                super().forward,  # 这里是关键修复点
                 hidden_states,
                 attention_mask=full_attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 kv_cache=kv_caches[self.layer_number],
                 use_cache=use_cache,
-                #use_reentrant=self.config.recompute_use_reentrant,
             )
         else:
             hidden_states, kv_cache = super().forward(
-                hidden_states = hidden_states, attention_mask = full_attention_mask, rotary_pos_emb=rotary_pos_emb,kv_cache=kv_caches[self.layer_number],use_cache=use_cache
+                hidden_states=hidden_states, 
+                attention_mask=full_attention_mask, 
+                rotary_pos_emb=rotary_pos_emb,
+                kv_cache=kv_caches[self.layer_number],
+                use_cache=use_cache
             )
-        #logger.info(f"GLMBlockPipe:")
-        #logger.info(f"hidden_states{hidden_states}")
-        #logger.info(f"full_attention_mask{full_attention_mask}")
-        #logger.info(f"rotary_pos_emb{rotary_pos_emb}")
-        return return_args(hidden_states, rotary_pos_emb , full_attention_mask)
+        return return_args(hidden_states, rotary_pos_emb, full_attention_mask)
 
 
 class RMSNormPipe(nn.Layer):
@@ -428,26 +372,20 @@ class RMSNormPipe(nn.Layer):
         self.config = config
 
     def forward(self, args):
-        ##logger.info(f"forward RMSNormPipe")
         hidden_states, full_attention_mask, rotary_pos_emb= parse_args(args)
         input_dtype = hidden_states.dtype
         variance = hidden_states.astype("float32").pow(2).mean(-1, keepdim=True)
         hidden_states = paddle.rsqrt(variance + self.epsilon) * hidden_states
         outputs = (hidden_states * self.weight).astype(input_dtype)
-        #logger.info(f"RMSNormPipe")
-        #logger.info(f"outputs{outputs}")
         return outputs
     
 class OutputLayerPipe(nn.Linear):
 
     def forward(self, hidden_states):
-        ##logger.info(f"forward OutputLayerPipe")
         lm_logits = super().forward(
                 hidden_states
             )
         lm_logits = lm_logits.transpose([1, 0, 2])
-        #logger.info(f"OutputLayerPipe")
-        #logger.info(f"lm_logits{lm_logits}")
         return lm_logits
     
 class TpOutputLayerPipe(fleet.meta_parallel.ColumnParallelLinear):
@@ -513,7 +451,6 @@ class ChatGLMv2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
             self.add_sequential_layer(LayerDesc(RotaryEmbeddingPipe, config=config ,dim = rotary_dim // 2), "chatglm_v2.rotary_pos_emb")
             
         for i in range(config.num_hidden_layers):
-        #for i in range(2):
             self.add_sequential_layer(
                 LayerDesc(GLMBlockPipe, config=config,layer_number=i, layerwise_recompute=i not in self.no_recompute_layers,kv_caches = None),
                 f"chatglm_v2.encoder.layers.{i}",
@@ -522,17 +459,16 @@ class ChatGLMv2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         if self.post_layer_norm:
             LayerNormFunc = RMSNormPipe if config.rmsnorm else nn.LayerNorm
             self.add_sequential_layer(LayerDesc(LayerNormFunc,config=config,hidden_size=config.hidden_size, epsilon=config.layernorm_epsilon), "chatglm_v2.encoder.final_layernorm")
-        if config.tensor_parallel_degree > 1:
-            self.add_sequential_layer(LayerDesc(TpOutputLayerPipe,in_features=config.hidden_size,out_features=config.padded_vocab_size,has_bias=False), "chatglm_v2.output_layer")
-        else:
-            self.add_sequential_layer(LayerDesc(OutputLayerPipe,in_features=config.hidden_size,out_features=config.padded_vocab_size,bias_attr=False), "chatglm_v2.output_layer")
+        # if config.tensor_parallel_degree > 1:
+        #     self.add_sequential_layer(LayerDesc(TpOutputLayerPipe,in_features=config.hidden_size,out_features=config.padded_vocab_size,has_bias=False), "chatglm_v2.output_layer")
+        # else:
+        self.add_sequential_layer(LayerDesc(OutputLayerPipe,in_features=config.hidden_size,out_features=config.padded_vocab_size,bias_attr=False), "chatglm_v2.output_layer")
 
         recompute_interval = 0
 
         seg_method = "layer:GLMBlock"
         if config.num_hidden_layers % get_hcg().topology().get_dim_size("pipe") != 0:
             seg_method = "uniform"
-        ## ##logger.info(f"self.get_sequential_layers():{self.get_sequential_layers()}")
         PipelineLayer.__init__(
             self,
             layers=self.get_sequential_layers(),
@@ -549,3 +485,4 @@ class ChatGLMv2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         )
 
         self.apply(self._init_weights)
+
