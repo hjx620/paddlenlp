@@ -165,6 +165,7 @@ class CoreAttention(nn.Layer):
 
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
+
     def forward(self, query_layer, key_layer, value_layer, attention_mask=None):
         # Raw attention scores
         # [batch_size, num_heads, query_length, key_length]
@@ -207,11 +208,8 @@ class CoreAttention(nn.Layer):
             tril_attention_mask = paddle.tril(tril_attention_mask)
             # Invert the mask (logical NOT)
             tril_attention_mask = ~tril_attention_mask
-            #attention_scores = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
-            attention_scores = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), attention_scores)
+            full_attention_mask = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
         elif full_attention_mask is not None and attention_scores.shape[2] == attention_scores.shape[3]:
-            if full_attention_mask.dtype == paddle.bool:
-                full_attention_mask = paddle.where(full_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
             # Create a lower triangular mask with ones
             tril_attention_mask = paddle.ones(
                 shape=[output_size[0], 1, output_size[2], output_size[3]],
@@ -223,11 +221,12 @@ class CoreAttention(nn.Layer):
             tril_attention_mask = ~tril_attention_mask
             tril_attention_mask = paddle.where(tril_attention_mask, paddle.full_like(attention_scores, float("-inf")), paddle.zeros_like(attention_scores))
             full_attention_mask = full_attention_mask + tril_attention_mask
-            attention_scores = attention_scores + full_attention_mask
 
-        attention_probs = F.softmax(attention_scores, axis=-1)
-        #attention_probs = F.softmax(attention_scores.astype("float32"), axis=-1)
-        attention_probs = attention_probs.astype(value_layer.dtype)
+        if full_attention_mask is not None:
+            attention_scores = attention_scores + full_attention_mask#这一句没用要修改，要把
+
+        attention_probs = F.softmax(attention_scores.astype("float32"), axis=-1)
+        attention_probs = attention_probs.astype(self.default_dtype)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -254,7 +253,6 @@ class CoreAttention(nn.Layer):
         context_layer = context_layer.reshape(new_context_shape)
 
         return context_layer
-
 
 class SelfAttention(nn.Layer):
     """Parallel self-attention layer abstract class.
@@ -1232,4 +1230,3 @@ class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
-    
