@@ -467,11 +467,13 @@ class GLMBlock(nn.Layer):
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
+        #logger.info("layernorm_output")
 
         # Self attention.
         attention_output, kv_cache = self.self_attention(
             layernorm_output, attention_mask, rotary_pos_emb, kv_cache=kv_cache, use_cache=use_cache
         )
+        #logger.info("self attention")
 
 
         # Residual connection.
@@ -482,9 +484,11 @@ class GLMBlock(nn.Layer):
 
         layernorm_input = F.dropout(attention_output, p=self.hidden_dropout, training=self.training)
         layernorm_input = residual + layernorm_input
+        #logger.info("layernorm_input")
 
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
+        #logger.info("layernorm_output")
 
         # MLP.
 
@@ -499,6 +503,7 @@ class GLMBlock(nn.Layer):
 
         output = F.dropout(mlp_output, p=self.hidden_dropout, training=self.training)
         output = residual + output
+        # logger.info("output")
         #logger.info(f"GLMBlock")
         #logger.info(f"output:{output}")
         #logger.info(f"kv_cache:{kv_cache}")
@@ -1083,7 +1088,7 @@ class ChatGLMv2PretrainingCriterion(nn.Layer):
 
         """
         with paddle.amp.auto_cast(False):
-            ##logger.info(f"forward ChatGLMv2PretrainingCriterion")
+            #logger.info(f"forward ChatGLMv2PretrainingCriterion")
             shift_logits = prediction_scores[:, :-1, :].contiguous()
             shift_labels = masked_lm_labels[:, 1:].contiguous()
             shift_logits = shift_logits.reshape([-1, shift_logits.shape[-1]])
@@ -1093,7 +1098,7 @@ class ChatGLMv2PretrainingCriterion(nn.Layer):
             #logger.info(f"shift_logits{shift_logits}")
             #logger.info(f"shift_labels{shift_labels}")
             loss = self.loss_func(shift_logits, shift_labels)            
-            ########logger.info(F"loss{loss}")
+            #logger.info(F"loss{loss}")
         return loss
     
 class ChatGLMv2ForCausalLM(ChatGLMv2PretrainedModel):
