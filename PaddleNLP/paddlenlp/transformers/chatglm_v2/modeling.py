@@ -658,7 +658,12 @@ class ChatGLMv2PretrainedModel(PretrainedModel):
             full_attention_mask -= (padding_mask.unsqueeze(-1).astype('float32') - 1)
         
         # Convert to boolean mask (similar to < 0.5 in PyTorch)
-        full_attention_mask = (full_attention_mask < 0.5).astype('bool')
+        bool_mask = (full_attention_mask < 0.5)
+        full_attention_mask = paddle.where(
+            bool_mask,
+            paddle.full_like(full_attention_mask, float("-inf"), dtype='float32'),
+            paddle.zeros_like(full_attention_mask, dtype='float32')
+        )
         
         # Add an extra dimension to full_attention_mask
         full_attention_mask = full_attention_mask.unsqueeze(1)
